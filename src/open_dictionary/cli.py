@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from .db import cleaner as db_cleaner
 from .db import mark_commonness as db_commonness
-from .llm import define_enricher as llm_define_enricher
+from .workflow import generate_json_from_csv
 from .wikitionary.downloader import DEFAULT_WIKTIONARY_URL, download_wiktionary_dump
 from .wikitionary.extract import extract_wiktionary_dump
 from .wikitionary.filter import filter_languages
@@ -39,6 +39,7 @@ COMMAND_NAMES = {
     "db-commonness",
     "llm-define",
     "pre-process",
+    "generate-from-csv",
 }
 
 
@@ -260,6 +261,8 @@ def _cmd_llm_define(args: argparse.Namespace) -> int:
         _ = _get_conninfo(args)
     except RuntimeError as exc:
         args._parser.error(str(exc))
+
+    from .llm import define_enricher as llm_define_enricher
 
     llm_define_enricher.enrich_definitions(
         table_name=args.table,
@@ -665,29 +668,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     llm_define_parser.add_argument(
         "--table",
-        default=llm_define_enricher.DEFAULT_TABLE_NAME,
+        default="dictionary_filtered_en",
         help="Source table containing JSONB entries (default: %(default)s).",
     )
     llm_define_parser.add_argument(
         "--source-column",
-        default=llm_define_enricher.DEFAULT_SOURCE_COLUMN,
+        default="data",
         help="Column containing original Wiktionary payloads (default: %(default)s).",
     )
     llm_define_parser.add_argument(
         "--target-column",
-        default=llm_define_enricher.DEFAULT_TARGET_COLUMN,
+        default="new_speak",
         help="Column to store LLM-enriched JSONB (default: %(default)s).",
     )
     llm_define_parser.add_argument(
         "--fetch-batch-size",
         type=int,
-        default=llm_define_enricher.DEFAULT_FETCH_BATCH_SIZE,
+        default=400,
         help="Rows fetched from PostgreSQL per server-side batch (default: %(default)s).",
     )
     llm_define_parser.add_argument(
         "--llm-batch-size",
         type=int,
-        default=llm_define_enricher.DEFAULT_LLM_BATCH_SIZE,
+        default=40,
         help="Number of requests dispatched to the LLM at once (default: %(default)s).",
     )
     llm_define_parser.add_argument(
@@ -698,31 +701,31 @@ def _build_parser() -> argparse.ArgumentParser:
     llm_define_parser.add_argument(
         "--max-retries",
         type=int,
-        default=llm_define_enricher.DEFAULT_MAX_RETRIES,
+        default=5,
         help="Attempts per row before giving up (default: %(default)s).",
     )
     llm_define_parser.add_argument(
         "--initial-backoff-seconds",
         type=float,
-        default=llm_define_enricher.DEFAULT_INITIAL_BACKOFF_SECONDS,
+        default=5.0,
         help="Initial retry backoff in seconds (default: %(default)s).",
     )
     llm_define_parser.add_argument(
         "--max-backoff-seconds",
         type=float,
-        default=llm_define_enricher.DEFAULT_MAX_BACKOFF_SECONDS,
+        default=60.0,
         help="Maximum retry backoff in seconds (default: %(default)s).",
     )
     llm_define_parser.add_argument(
         "--progress-every-rows",
         type=int,
-        default=llm_define_enricher.DEFAULT_PROGRESS_EVERY_ROWS,
+        default=120,
         help="Emit progress after processing this many rows (default: %(default)s).",
     )
     llm_define_parser.add_argument(
         "--progress-every-seconds",
         type=float,
-        default=llm_define_enricher.DEFAULT_PROGRESS_EVERY_SECONDS,
+        default=30.0,
         help="Emit progress at least this often in seconds (default: %(default)s).",
     )
     llm_define_parser.add_argument(
@@ -732,6 +735,102 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_database_options(llm_define_parser)
     llm_define_parser.set_defaults(func=_cmd_llm_define, _parser=llm_define_parser)
+
+    generate_from_csv_parser = subparsers.add_parser(
+        "generate-from-csv",
+        help="Read words from CSV and generate per-word JSON files via LLM.",
+    )
+    generate_from_csv_parser.add_argument(
+        "--csv",
+        type=Path,
+        default=Path("data/missing_words.csv"),
+        help="CSV file with a 'word' column (default: data/missing_words.csv).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--jsonl",
+        type=Path,
+        help="Path to raw Wiktionary JSONL file; if absent and --auto-download, will download/extract.",
+    )
+    generate_from_csv_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data/words_json"),
+        help="Directory to write per-word JSON files (default: data/words_json).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing JSON files if present.",
+    )
+    generate_from_csv_parser.add_argument(
+        "--use-toon",
+        action="store_true",
+        help="Preprocess payload to TOON before LLM (reduces tokens).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=20,
+        help="Maximum concurrent LLM requests (default: 20).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Limit the number of words processed from CSV (optional).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--auto-download",
+        action="store_true",
+        help="Auto download and extract JSONL if not present.",
+    )
+    generate_from_csv_parser.add_argument(
+        "--url",
+        default=DEFAULT_WIKTIONARY_URL,
+        help="Source URL for the Wiktionary dump used for JSONL (default: official).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--fail-log",
+        type=Path,
+        default=Path("data/words_json_failures.log"),
+        help="Path to write failed words list (default: data/words_json_failures.log).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--fail-jsonl",
+        type=Path,
+        default=Path("data/words_json_failures.jsonl"),
+        help="Path to write structured failure reasons as JSONL (default: data/words_json_failures.jsonl).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--no-timestamp-logs",
+        action="store_true",
+        help="Disable timestamp suffix in failure log filenames (default: enabled).",
+    )
+    generate_from_csv_parser.add_argument(
+        "--fallback-on-not-found",
+        action="store_true",
+        help="When a word is not found in raw JSONL, still generate via LLM with a minimal stub.",
+    )
+
+    def _cmd_generate_from_csv(args: argparse.Namespace) -> int:
+        generate_json_from_csv(
+            csv_path=str(args.csv),
+            jsonl_path=str(args.jsonl) if args.jsonl else None,
+            output_dir=str(args.output_dir),
+            overwrite=args.overwrite,
+            use_toon=args.use_toon,
+            max_workers=args.max_workers,
+            auto_download=args.auto_download,
+            source_url=str(args.url),
+            limit=(int(args.limit) if args.limit else None),
+            fail_log=str(args.fail_log) if args.fail_log else None,
+            fail_jsonl=str(args.fail_jsonl) if args.fail_jsonl else None,
+            timestamp_logs=(not bool(getattr(args, "no_timestamp_logs", False))),
+            fallback_on_not_found=bool(getattr(args, "fallback_on_not_found", False)),
+        )
+        print(f"Generated JSON files in {args.output_dir}")
+        return 0
+
+    generate_from_csv_parser.set_defaults(func=_cmd_generate_from_csv, _parser=generate_from_csv_parser)
 
     return parser
 
