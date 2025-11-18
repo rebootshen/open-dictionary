@@ -810,6 +810,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="When a word is not found in raw JSONL, still generate via LLM with a minimal stub.",
     )
+    generate_from_csv_parser.add_argument(
+        "--no-preserve-existing",
+        action="store_true",
+        help="Do not preserve non-empty fields from existing JSON when overwriting.",
+    )
 
     def _cmd_generate_from_csv(args: argparse.Namespace) -> int:
         generate_json_from_csv(
@@ -826,6 +831,7 @@ def _build_parser() -> argparse.ArgumentParser:
             fail_jsonl=str(args.fail_jsonl) if args.fail_jsonl else None,
             timestamp_logs=(not bool(getattr(args, "no_timestamp_logs", False))),
             fallback_on_not_found=bool(getattr(args, "fallback_on_not_found", False)),
+            preserve_existing=(not bool(getattr(args, "no_preserve_existing", False))),
         )
         print(f"Generated JSON files in {args.output_dir}")
         return 0

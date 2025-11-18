@@ -246,6 +246,7 @@ def generate_json_from_csv(
     fail_jsonl: str | None = "data/words_json_failures.jsonl",
     timestamp_logs: bool = True,
     fallback_on_not_found: bool = False,
+    preserve_existing: bool = True,
 ):
     words: list[str] = []
     with open(csv_path, "r", encoding="utf-8") as f:
@@ -283,6 +284,31 @@ def generate_json_from_csv(
     targets: set[str] = set(words)
     payloads: dict[str, str] = {}
 
+    COMMON_CORRECTIONS: dict[str, str] = {
+        "abruptnes": "abruptness",
+        "absent-minde": "absent-minded",
+        "abstemiou": "abstemious",
+        "abys": "abyss",
+        "esophagu": "esophagus",
+        "epistolari": "epistolary",
+        "laboriou": "laborious",
+        "laborsave": "laborsaving",
+        "nowcaste": "nowcast",
+    }
+
+    # Merge custom corrections from file if present
+    custom_corrections_path = Path("data/corrections_custom.json")
+    if custom_corrections_path.exists():
+        try:
+            with open(custom_corrections_path, "r", encoding="utf-8") as cf:
+                loaded = json.load(cf)
+                if isinstance(loaded, dict):
+                    for k, v in loaded.items():
+                        if isinstance(k, str) and isinstance(v, str):
+                            COMMON_CORRECTIONS[k] = v
+        except Exception:
+            pass
+
     def _normalize_variants(w: str) -> set[str]:
         s = w.strip()
         v: set[str] = set()
@@ -292,17 +318,49 @@ def generate_json_from_csv(
         v.add(s.replace(" ", "-"))
         v.add(s.replace("'", ""))
         v.add(s.lower().replace("'", ""))
+        if "-" in s:
+            parts = [p.strip() for p in s.split("-")]
+            cap = "-".join(p.capitalize() for p in parts)
+            v.add(cap)
+            v.add(cap.replace("-", " "))
         nfkd = unicodedata.normalize("NFKD", s)
         ascii_only = "".join(ch for ch in nfkd if ord(ch) < 128)
         if ascii_only:
             v.add(ascii_only)
             v.add(ascii_only.lower())
+        if s.lower().endswith("ans"):
+            v.add(s[:-1])
+            v.add(s[:-1].lower())
+        if s.lower().endswith("ians"):
+            v.add(s[:-1])
+            v.add(s[:-1].lower())
+        if s.lower().endswith("an"):
+            v.add(s + "s")
+            v.add((s + "s").lower())
+        if s.lower().endswith("ian"):
+            v.add(s + "s")
+            v.add((s + "s").lower())
+        # Common suffix completions
+        suffixes = [
+            "s", "es", "ed", "ing", "ness", "ious", "ous", "ary", "al", "ical",
+            "cast", "saving", "minded",
+        ]
+        for suf in suffixes:
+            v.add((s + suf).lower())
+        # Hyphenated common completions
+        hyphen_suffixes = ["-minded", "-saving"]
+        for hs in hyphen_suffixes:
+            v.add((s + hs).lower())
         return v
 
     variant_map: dict[str, str] = {}
     for w in words:
         for v in _normalize_variants(w):
             variant_map[v] = w
+        cw = COMMON_CORRECTIONS.get(w)
+        if cw:
+            for v in _normalize_variants(cw):
+                variant_map[v] = w
 
     with open(jsonl_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -313,7 +371,16 @@ def generate_json_from_csv(
             w = obj.get("word")
             if not isinstance(w, str):
                 continue
-            mk = w if w in targets else variant_map.get(w)
+            w_l = w.lower()
+            mk = None
+            if w in targets:
+                mk = w
+            elif w_l in targets:
+                mk = w_l
+            elif w in variant_map:
+                mk = variant_map.get(w)
+            elif w_l in variant_map:
+                mk = variant_map.get(w_l)
             if mk is None:
                 continue
             lang = obj.get("lang_code")
@@ -377,21 +444,52 @@ def generate_json_from_csv(
         out_file = out_dir / f"{w}.json"
         if out_file.exists() and not overwrite:
             continue
-        with open(out_file, "w", encoding="utf-8") as f:
-            if item and item.get("ok"):
-                definition = item.get("definition")
-                json.dump(definition, f, ensure_ascii=False, indent=2)
-            else:
-                failed_words.append(w)
-                err_reason = item.get("reason") if item else "unknown"
-                err_obj: dict[str, Any] = {"word": w, "error": err_reason or "definition generation failed"}
-                json.dump(err_obj, f, ensure_ascii=False, indent=2)
-                fail_entry: dict[str, Any] = {"word": w, "reason": err_reason}
-                if item and item.get("details"):
-                    fail_entry["details"] = item.get("details")
-                if item and item.get("llm_response"):
-                    fail_entry["llm_response"] = item.get("llm_response")
-                failures.append(fail_entry)
+        if item and item.get("ok"):
+            new_def = item.get("definition")
+            if preserve_existing and out_file.exists():
+                try:
+                    old_def = json.load(open(out_file, "r", encoding="utf-8"))
+                except Exception:
+                    old_def = None
+                if isinstance(old_def, dict) and isinstance(new_def, dict):
+                    for key in ("pos", "concise_definition"):
+                        if (not new_def.get(key)) and old_def.get(key):
+                            new_def[key] = old_def.get(key)
+                    if isinstance(new_def.get("pronunciations"), dict) and isinstance(old_def.get("pronunciations"), dict):
+                        pr_new = new_def["pronunciations"]
+                        pr_old = old_def["pronunciations"]
+                        for k in ("ipa", "natural_phonics", "ogg_url"):
+                            if pr_new.get(k) is None and pr_old.get(k) is not None:
+                                pr_new[k] = pr_old.get(k)
+                    if (not new_def.get("forms")) and old_def.get("forms"):
+                        new_def["forms"] = old_def.get("forms")
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump(new_def, f, ensure_ascii=False, indent=2)
+        else:
+            failed_words.append(w)
+            err_reason = item.get("reason") if item else "unknown"
+            # Do NOT write error stubs to user JSON files
+            # If an existing non-error file is present, preserve it and only log failure
+            if preserve_existing and out_file.exists():
+                try:
+                    old_def_chk = json.load(open(out_file, "r", encoding="utf-8"))
+                except Exception:
+                    old_def_chk = None
+                if isinstance(old_def_chk, dict) and ("error" not in old_def_chk):
+                    fail_entry: dict[str, Any] = {"word": w, "reason": err_reason}
+                    if item and item.get("details"):
+                        fail_entry["details"] = item.get("details")
+                    if item and item.get("llm_response"):
+                        fail_entry["llm_response"] = item.get("llm_response")
+                    failures.append(fail_entry)
+                    continue
+            # If no existing file or it's an error file, skip creating error file and only log failure
+            fail_entry: dict[str, Any] = {"word": w, "reason": err_reason}
+            if item and item.get("details"):
+                fail_entry["details"] = item.get("details")
+            if item and item.get("llm_response"):
+                fail_entry["llm_response"] = item.get("llm_response")
+            failures.append(fail_entry)
 
     if fail_log and failed_words:
         if timestamp_logs:
